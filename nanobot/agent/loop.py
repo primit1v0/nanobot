@@ -55,6 +55,7 @@ from nanobot.utils.progress_events import (
     on_progress_accepts_tool_events,
 )
 from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
+from nanobot.utils.webui_titles import mark_webui_session, maybe_generate_webui_title_after_turn
 
 if TYPE_CHECKING:
     from nanobot.config.schema import ChannelsConfig, ExecToolConfig, ToolsConfig, WebToolsConfig
@@ -112,6 +113,11 @@ class _LoopHook(AgentHook):
 
     async def before_iteration(self, context: AgentHookContext) -> None:
         self._loop._current_iteration = context.iteration
+        logger.debug(
+            "Starting agent loop iteration {} for session {}",
+            context.iteration,
+            self._session_key,
+        )
 
     async def before_execute_tools(self, context: AgentHookContext) -> None:
         if self._on_progress:
@@ -422,7 +428,7 @@ class AgentLoop:
             logger.warning("MCP connection cancelled (will retry next message)")
             self._mcp_stacks.clear()
         except BaseException as e:
-            logger.error("Failed to connect MCP servers (will retry next message): {}", e)
+            logger.warning("Failed to connect MCP servers (will retry next message): {}", e)
             self._mcp_stacks.clear()
         finally:
             self._mcp_connecting = False
@@ -648,6 +654,7 @@ class AgentLoop:
                 context_block_limit=self.context_block_limit,
                 provider_retry_mode=self.provider_retry_mode,
                 progress_callback=on_progress,
+                stream_progress_deltas=on_stream is not None,
                 retry_wait_callback=on_retry_wait,
                 checkpoint_callback=_checkpoint,
                 injection_callback=_drain_pending,
@@ -800,6 +807,33 @@ class AgentLoop:
                             channel=msg.channel, chat_id=msg.chat_id,
                             content="", metadata=msg.metadata or {},
                         ))
+                    if msg.channel == "websocket":
+                        # Signal that the turn is fully complete (all tools executed,
+                        # final text streamed).  This lets WS clients know when to
+                        # definitively stop the loading indicator.
+                        await self.bus.publish_outbound(OutboundMessage(
+                            channel=msg.channel, chat_id=msg.chat_id,
+                            content="", metadata={**msg.metadata, "_turn_end": True},
+                        ))
+                        if msg.metadata.get("webui") is True:
+                            async def _generate_title_and_notify() -> None:
+                                generated = await maybe_generate_webui_title_after_turn(
+                                    channel=msg.channel,
+                                    metadata=msg.metadata,
+                                    sessions=self.sessions,
+                                    session_key=session_key,
+                                    provider=self.provider,
+                                    model=self.model,
+                                )
+                                if generated:
+                                    await self.bus.publish_outbound(OutboundMessage(
+                                        channel=msg.channel,
+                                        chat_id=msg.chat_id,
+                                        content="",
+                                        metadata={**msg.metadata, "_session_updated": True},
+                                    ))
+
+                            self._schedule_background(_generate_title_and_notify())
                 except asyncio.CancelledError:
                     logger.info("Task cancelled for session {}", session_key)
                     # Preserve partial context from the interrupted turn so
@@ -903,6 +937,8 @@ class AgentLoop:
                 self.sessions.save(session)
 
             session, pending = self.auto_compact.prepare_session(session, key)
+            if pending:
+                logger.info("Memory compact triggered for session {}", key)
 
             await self.consolidator.maybe_consolidate_by_tokens(
                 session,
@@ -915,6 +951,7 @@ class AgentLoop:
             # LLM via the merged prompt. See _persist_subagent_followup.
             is_subagent = msg.sender_id == "subagent"
             if is_subagent and self._persist_subagent_followup(session, msg):
+                logger.debug("Subagent result persisted for session {}", key)
                 self.sessions.save(session)
             self._set_tool_context(
                 channel, chat_id, msg.metadata.get("message_id"),
@@ -986,6 +1023,7 @@ class AgentLoop:
 
         key = session_key or msg.session_key
         session = self.sessions.get_or_create(key)
+        mark_webui_session(session, msg.metadata)
         if self._restore_runtime_checkpoint(session):
             self.sessions.save(session)
         if self._restore_pending_user_turn(session):
@@ -1131,7 +1169,7 @@ class AgentLoop:
             ask_user_options_from_messages(all_msgs) if stop_reason == "ask_user" else [],
             msg.channel,
         )
-        if on_stream is not None and stop_reason not in {"ask_user", "error"}:
+        if on_stream is not None and stop_reason not in {"ask_user", "error", "tool_error"}:
             meta["_streamed"] = True
         return OutboundMessage(
             channel=msg.channel,

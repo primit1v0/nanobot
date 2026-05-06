@@ -21,6 +21,22 @@ if sys.platform == "win32":
 
 import typer
 from loguru import logger
+
+# Remove default handler and re-add with unified nanobot format
+logger.remove()
+_log_handler_id = logger.add(
+    sys.stderr,
+    format=(
+        "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
+        "<level>{level: <5}</level> | "
+        "<cyan>{extra[channel]}</cyan> | "
+        "<level>{message}</level>"
+    ),
+    level="INFO",
+    colorize=None,
+    filter=lambda record: record["extra"].setdefault("channel", "-") or True,
+)
+
 from prompt_toolkit import PromptSession, print_formatted_text
 from prompt_toolkit.application import run_in_terminal
 from prompt_toolkit.formatted_text import ANSI, HTML
@@ -215,6 +231,29 @@ async def _print_interactive_progress_line(text: str, thinking: ThinkingSpinner 
         return
     with thinking.pause() if thinking else nullcontext():
         await _print_interactive_line(text)
+
+
+async def _maybe_print_interactive_progress(
+    msg: Any,
+    thinking: ThinkingSpinner | None,
+    channels_config: Any,
+) -> bool:
+    metadata = msg.metadata or {}
+    if metadata.get("_retry_wait"):
+        await _print_interactive_progress_line(msg.content, thinking)
+        return True
+
+    if not metadata.get("_progress"):
+        return False
+
+    is_tool_hint = metadata.get("_tool_hint", False)
+    if channels_config and is_tool_hint and not channels_config.send_tool_hints:
+        return True
+    if channels_config and not is_tool_hint and not channels_config.send_progress:
+        return True
+
+    await _print_interactive_progress_line(msg.content, thinking)
+    return True
 
 
 def _is_exit_command(command: str) -> bool:
@@ -575,9 +614,19 @@ def gateway(
 ):
     """Start the nanobot gateway."""
     if verbose:
-        import logging
-
-        logging.basicConfig(level=logging.DEBUG)
+        logger.remove(_log_handler_id)
+        logger.add(
+            sys.stderr,
+            format=(
+                "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
+                "<level>{level: <5}</level> | "
+                "<cyan>{extra[channel]}</cyan> | "
+                "<level>{message}</level>"
+            ),
+            level="DEBUG",
+            colorize=None,
+            filter=lambda record: record["extra"].setdefault("channel", "-") or True,
+        )
     cfg = _load_runtime_config(config, workspace)
     _run_gateway(cfg, port=port)
 
@@ -1131,15 +1180,11 @@ def agent(
                             turn_done.set()
                             continue
 
-                        if msg.metadata.get("_progress"):
-                            is_tool_hint = msg.metadata.get("_tool_hint", False)
-                            ch = agent_loop.channels_config
-                            if ch and is_tool_hint and not ch.send_tool_hints:
-                                pass
-                            elif ch and not is_tool_hint and not ch.send_progress:
-                                pass
-                            else:
-                                await _print_interactive_progress_line(msg.content, _thinking)
+                        if await _maybe_print_interactive_progress(
+                            msg,
+                            _thinking,
+                            agent_loop.channels_config,
+                        ):
                             continue
 
                         if not turn_done.is_set():
