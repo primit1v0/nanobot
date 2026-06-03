@@ -1480,10 +1480,10 @@ def test_gateway_cron_job_streams_when_channel_supports_it(
     assert calls[4].args[0].metadata.get("_turn_end") is True
 
 
-def test_gateway_cron_job_streaming_respects_evaluator_rejection(
+def test_gateway_cron_job_streaming_respects_disabled_delivery(
     monkeypatch, tmp_path: Path
 ) -> None:
-    """Streaming cron output must not reach the channel before evaluator approval."""
+    """Streaming cron output must not reach the channel when delivery is disabled."""
     config_file = tmp_path / "instance" / "config.json"
     config_file.parent.mkdir(parents=True)
     config_file.write_text("{}")
@@ -1508,10 +1508,6 @@ def test_gateway_cron_job_streaming_respects_evaluator_rejection(
     )
     monkeypatch.setattr("nanobot.bus.queue.MessageBus", lambda: bus)
     monkeypatch.setattr("nanobot.session.manager.SessionManager", lambda _workspace: object())
-
-    async def _reject(*_args, **_kwargs) -> bool:
-        seen["evaluated"] = True
-        return False
 
     class _FakeStreamingChannel:
         supports_streaming = True
@@ -1577,10 +1573,6 @@ def test_gateway_cron_job_streaming_respects_evaluator_rejection(
     monkeypatch.setattr("nanobot.cron.service.CronService", _FakeCron)
     monkeypatch.setattr("nanobot.cli.commands.AgentLoop", _FakeAgentLoop)
     monkeypatch.setattr("nanobot.channels.manager.ChannelManager", _FakeChannelManager)
-    monkeypatch.setattr(
-        "nanobot.utils.evaluator.evaluate_response",
-        _reject,
-    )
 
     result = runner.invoke(app, ["gateway", "--config", str(config_file)])
     assert result.exit_code == 0
@@ -1591,7 +1583,7 @@ def test_gateway_cron_job_streaming_respects_evaluator_rejection(
         name="test-stream-rejected",
         payload=CronPayload(
             message="Say something optional.",
-            deliver=True,
+            deliver=False,
             channel="websocket",
             to="user-1",
         ),
@@ -1599,8 +1591,8 @@ def test_gateway_cron_job_streaming_respects_evaluator_rejection(
     response = asyncio.run(cron.on_job(job))
 
     assert response == "This should not leak"
-    assert seen["on_stream"] is not None
-    assert seen["on_stream_end"] is not None
+    assert seen["on_stream"] is None
+    assert seen["on_stream_end"] is None
     bus.publish_outbound.assert_not_awaited()
 
 
