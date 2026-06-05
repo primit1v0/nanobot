@@ -426,7 +426,7 @@ class TestSubagentCancellation:
 
 
 class TestSubagentAnnounceSessionKey:
-    """Verify _announce_result uses the effective session key for mid-turn routing."""
+    """Verify _announce_result stores results under the effective session key."""
 
     def _make_mgr(self):
         """Create a SubagentManager with mocked deps and its bus."""
@@ -447,27 +447,27 @@ class TestSubagentAnnounceSessionKey:
     @pytest.mark.asyncio
     async def test_announce_uses_effective_key_in_unified_mode(self):
         """In unified session mode, session_key_override must be 'unified:default'
-        so the result matches the pending queue key."""
+        so the result matches the manager mailbox session key."""
         mgr, bus = self._make_mgr()
 
         origin = {"channel": "telegram", "chat_id": "111", "session_key": "unified:default"}
         await mgr._announce_result("sub-1", "label", "task", "result", origin, "ok")
 
-        msg = await bus.consume_inbound()
-        assert msg.session_key_override == "unified:default"
-        assert msg.session_key == "unified:default"
+        assert bus.inbound.empty()
+        snapshots = await mgr.mailbox.poll("unified:default", task_id="sub-1")
+        assert snapshots[0].session_key == "unified:default"
 
     @pytest.mark.asyncio
     async def test_announce_uses_raw_key_in_normal_mode(self):
-        """Without unified sessions, session_key_override is the raw channel:chat_id."""
+        """Without unified sessions, the mailbox session is the raw channel:chat_id."""
         mgr, bus = self._make_mgr()
 
         origin = {"channel": "telegram", "chat_id": "222", "session_key": "telegram:222"}
         await mgr._announce_result("sub-2", "label", "task", "result", origin, "ok")
 
-        msg = await bus.consume_inbound()
-        assert msg.session_key_override == "telegram:222"
-        assert msg.session_key == "telegram:222"
+        assert bus.inbound.empty()
+        snapshots = await mgr.mailbox.poll("telegram:222", task_id="sub-2")
+        assert snapshots[0].session_key == "telegram:222"
 
     @pytest.mark.asyncio
     async def test_announce_falls_back_to_origin_when_no_session_key(self):
@@ -477,10 +477,9 @@ class TestSubagentAnnounceSessionKey:
         origin = {"channel": "discord", "chat_id": "333", "session_key": None}
         await mgr._announce_result("sub-3", "label", "task", "result", origin, "ok")
 
-        msg = await bus.consume_inbound()
-        assert msg.session_key_override == "discord:333"
-        assert msg.channel == "system"
-        assert msg.chat_id == "discord:333"
+        assert bus.inbound.empty()
+        snapshots = await mgr.mailbox.poll("discord:333", task_id="sub-3")
+        assert snapshots[0].session_key == "discord:333"
 
     @pytest.mark.asyncio
     async def test_session_key_flows_through_run_subagent(self):
@@ -509,5 +508,6 @@ class TestSubagentAnnounceSessionKey:
             status,
         )
 
-        msg = await bus.consume_inbound()
-        assert msg.session_key_override == "unified:default"
+        assert bus.inbound.empty()
+        snapshots = await mgr.mailbox.poll("unified:default", task_id="sub-4")
+        assert snapshots[0].session_key == "unified:default"
