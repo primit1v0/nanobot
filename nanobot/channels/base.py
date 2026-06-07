@@ -31,6 +31,7 @@ class BaseChannel(ABC):
     transcription_provider: str = "groq"
     transcription_api_key: str = ""
     transcription_api_base: str = ""
+    transcription_model: str = ""
     transcription_language: str | None = None
     send_progress: bool = True
     send_tool_hints: bool = False
@@ -60,6 +61,7 @@ class BaseChannel(ABC):
                     api_key=self.transcription_api_key,
                     api_base=self.transcription_api_base or None,
                     language=self.transcription_language or None,
+                    model=self.transcription_model or None,
                 )
             else:
                 from nanobot.providers.transcription import GroqTranscriptionProvider
@@ -67,6 +69,7 @@ class BaseChannel(ABC):
                     api_key=self.transcription_api_key,
                     api_base=self.transcription_api_base or None,
                     language=self.transcription_language or None,
+                    model=self.transcription_model or None,
                 )
             return await provider.transcribe(file_path)
         except Exception:

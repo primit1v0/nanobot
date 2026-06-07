@@ -12,7 +12,7 @@ from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.channels.manager import ChannelManager
-from nanobot.config.schema import ChannelsConfig
+from nanobot.config.schema import ChannelsConfig, TranscriptionConfig
 from nanobot.providers.transcription import GroqTranscriptionProvider as _GroqProvider
 from nanobot.providers.transcription import OpenAITranscriptionProvider as _OpenAIProvider
 from nanobot.utils.restart import RestartNotice
@@ -271,6 +271,78 @@ async def test_manager_propagates_groq_transcription_api_base_to_channels():
 
 
 @pytest.mark.asyncio
+async def test_manager_prefers_top_level_transcription_config_to_legacy_channels():
+    from nanobot.channels.manager import ChannelManager
+
+    fake_config = SimpleNamespace(
+        channels=ChannelsConfig.model_validate({
+            "fakeplugin": {"enabled": True, "allowFrom": ["*"]},
+            "transcriptionProvider": "openai",
+            "transcriptionLanguage": "en",
+        }),
+        transcription=TranscriptionConfig(
+            provider="groq",
+            model="whisper-large-v3-turbo",
+            language="ko",
+        ),
+        providers=SimpleNamespace(
+            groq=SimpleNamespace(api_key="groq-key", api_base="http://groq.local/v1"),
+            openai=SimpleNamespace(api_key="openai-key", api_base="http://openai.local/v1"),
+        ),
+    )
+
+    with patch(
+        "nanobot.channels.registry.discover_enabled",
+        return_value={"fakeplugin": _FakePlugin},
+    ):
+        mgr = ChannelManager.__new__(ChannelManager)
+        mgr.config = fake_config
+        mgr.bus = MessageBus()
+        mgr.channels = {}
+        mgr._dispatch_task = None
+        mgr._init_channels()
+
+    channel = mgr.channels["fakeplugin"]
+    assert channel.transcription_provider == "groq"
+    assert channel.transcription_api_key == "groq-key"
+    assert channel.transcription_api_base == "http://groq.local/v1"
+    assert channel.transcription_model == "whisper-large-v3-turbo"
+    assert channel.transcription_language == "ko"
+
+
+@pytest.mark.asyncio
+async def test_manager_disables_channel_transcription_from_top_level_config():
+    from nanobot.channels.manager import ChannelManager
+
+    fake_config = SimpleNamespace(
+        channels=ChannelsConfig.model_validate({
+            "fakeplugin": {"enabled": True, "allowFrom": ["*"]},
+            "transcriptionProvider": "openai",
+        }),
+        transcription=TranscriptionConfig(enabled=False, provider="openai"),
+        providers=SimpleNamespace(
+            openai=SimpleNamespace(api_key="openai-key", api_base="http://openai.local/v1"),
+            groq=SimpleNamespace(api_key="groq-key", api_base="http://groq.local/v1"),
+        ),
+    )
+
+    with patch(
+        "nanobot.channels.registry.discover_enabled",
+        return_value={"fakeplugin": _FakePlugin},
+    ):
+        mgr = ChannelManager.__new__(ChannelManager)
+        mgr.config = fake_config
+        mgr.bus = MessageBus()
+        mgr.channels = {}
+        mgr._dispatch_task = None
+        mgr._init_channels()
+
+    channel = mgr.channels["fakeplugin"]
+    assert channel.transcription_provider == "openai"
+    assert channel.transcription_api_key == ""
+
+
+@pytest.mark.asyncio
 async def test_manager_propagates_openai_transcription_api_base_to_channels():
     from nanobot.channels.manager import ChannelManager
 
@@ -314,15 +386,17 @@ async def test_base_channel_passes_api_base_to_openai_transcription_provider():
     channel.transcription_provider = "openai"
     channel.transcription_api_key = "k"
     channel.transcription_api_base = "http://override/v1/audio/transcriptions"
+    channel.transcription_model = "whisper-custom"
     channel.transcription_language = "en"
 
     captured: dict[str, object] = {}
 
     class _StubOpenAI:
-        def __init__(self, api_key=None, api_base=None, language=None):
+        def __init__(self, api_key=None, api_base=None, language=None, model=None):
             captured["api_key"] = api_key
             captured["api_base"] = api_base
             captured["language"] = language
+            captured["model"] = model
 
         async def transcribe(self, file_path):
             return "ok"
@@ -333,6 +407,7 @@ async def test_base_channel_passes_api_base_to_openai_transcription_provider():
     assert result == "ok"
     assert captured["api_key"] == "k"
     assert captured["api_base"] == "http://override/v1/audio/transcriptions"
+    assert captured["model"] == "whisper-custom"
     assert captured["language"] == "en"
 
 
@@ -357,15 +432,17 @@ async def test_base_channel_passes_language_to_groq_transcription_provider():
     channel.transcription_provider = "groq"
     channel.transcription_api_key = "k"
     channel.transcription_api_base = "http://override/v1/audio/transcriptions"
+    channel.transcription_model = "whisper-large-v3-turbo"
     channel.transcription_language = "ko"
 
     captured: dict[str, object] = {}
 
     class _StubGroq:
-        def __init__(self, api_key=None, api_base=None, language=None):
+        def __init__(self, api_key=None, api_base=None, language=None, model=None):
             captured["api_key"] = api_key
             captured["api_base"] = api_base
             captured["language"] = language
+            captured["model"] = model
 
         async def transcribe(self, file_path):
             return "ok"
@@ -376,6 +453,7 @@ async def test_base_channel_passes_language_to_groq_transcription_provider():
     assert result == "ok"
     assert captured["api_key"] == "k"
     assert captured["api_base"] == "http://override/v1/audio/transcriptions"
+    assert captured["model"] == "whisper-large-v3-turbo"
     assert captured["language"] == "ko"
 
 

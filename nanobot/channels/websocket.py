@@ -21,6 +21,7 @@ from websockets.http11 import Request as WsRequest
 from nanobot.bus.events import OUTBOUND_META_AGENT_UI, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
+from nanobot.config.loader import load_config
 from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import Base
 from nanobot.security.workspace_access import (
@@ -29,6 +30,7 @@ from nanobot.security.workspace_access import (
 )
 from nanobot.session.goal_state import goal_state_ws_blob
 from nanobot.session.webui_turns import websocket_turn_wall_started_at
+from nanobot.transcription import resolve_transcription_config, transcribe_audio_file
 from nanobot.utils.media_decode import (
     FileSizeExceeded,
     save_base64_data_url,
@@ -217,6 +219,7 @@ _MAX_IMAGES_PER_MESSAGE = 4
 _MAX_IMAGE_BYTES = 8 * 1024 * 1024
 _MAX_VIDEOS_PER_MESSAGE = 1
 _MAX_VIDEO_BYTES = 20 * 1024 * 1024
+_MAX_TRANSCRIPTION_AUDIO_BYTES_FALLBACK = 25 * 1024 * 1024
 
 # Image MIME whitelist — matches the Composer's ``accept`` list. SVG is
 # explicitly excluded to avoid the XSS surface inside embedded scripts.
@@ -233,9 +236,22 @@ _VIDEO_MIME_ALLOWED: frozenset[str] = frozenset({
     "video/quicktime",
 })
 
+_AUDIO_MIME_ALLOWED: frozenset[str] = frozenset({
+    "audio/aac",
+    "audio/flac",
+    "audio/m4a",
+    "audio/mp4",
+    "audio/mpeg",
+    "audio/ogg",
+    "audio/wav",
+    "audio/webm",
+    "audio/x-m4a",
+    "audio/x-wav",
+})
+
 _UPLOAD_MIME_ALLOWED: frozenset[str] = _IMAGE_MIME_ALLOWED | _VIDEO_MIME_ALLOWED
 
-_DATA_URL_MIME_RE = re.compile(r"^data:([^;]+);base64,", re.DOTALL)
+_DATA_URL_MIME_RE = re.compile(r"^data:([^;,]+)(?:;[^,]*)*;base64,", re.DOTALL)
 
 
 def _extract_data_url_mime(url: str) -> str | None:
@@ -418,7 +434,6 @@ class WebSocketChannel(BaseChannel):
             self._tokens.take_issued_token_if_valid(supplied)
         return None
 
-    # -- Server lifecycle and connection ingress ---------------------------
     # -- Server lifecycle and connection ingress ---------------------------
 
     async def start(self) -> None:
@@ -637,6 +652,113 @@ class WebSocketChannel(BaseChannel):
             paths.append(saved)
         return paths, None
 
+    async def _handle_transcribe_audio(self, connection: Any, envelope: dict[str, Any]) -> None:
+        request_id = envelope.get("request_id")
+        data_url = envelope.get("data_url")
+        if not isinstance(request_id, str) or not request_id or len(request_id) > 80:
+            await self._send_event(connection, "transcription_error", detail="invalid_request")
+            return
+        if not isinstance(data_url, str) or not data_url:
+            await self._send_event(
+                connection,
+                "transcription_error",
+                request_id=request_id,
+                detail="missing_audio",
+            )
+            return
+
+        resolved = resolve_transcription_config(load_config())
+        if not resolved.enabled:
+            await self._send_event(
+                connection,
+                "transcription_error",
+                request_id=request_id,
+                detail="disabled",
+            )
+            return
+        if not resolved.configured:
+            await self._send_event(
+                connection,
+                "transcription_error",
+                request_id=request_id,
+                detail="not_configured",
+                provider=resolved.provider,
+            )
+            return
+        duration_ms = envelope.get("duration_ms")
+        if (
+            isinstance(duration_ms, (int, float))
+            and duration_ms > (resolved.max_duration_sec * 1000 + 1000)
+        ):
+            await self._send_event(
+                connection,
+                "transcription_error",
+                request_id=request_id,
+                detail="duration",
+            )
+            return
+        mime = _extract_data_url_mime(data_url)
+        if mime not in _AUDIO_MIME_ALLOWED:
+            await self._send_event(
+                connection,
+                "transcription_error",
+                request_id=request_id,
+                detail="mime",
+            )
+            return
+
+        max_bytes = max(
+            1,
+            resolved.max_upload_mb * 1024 * 1024
+            if resolved.max_upload_mb
+            else _MAX_TRANSCRIPTION_AUDIO_BYTES_FALLBACK,
+        )
+        audio_path: str | None = None
+        try:
+            audio_path = save_base64_data_url(
+                data_url,
+                get_media_dir("websocket-transcription"),
+                max_bytes=max_bytes,
+            )
+        except FileSizeExceeded:
+            await self._send_event(
+                connection,
+                "transcription_error",
+                request_id=request_id,
+                detail="size",
+            )
+            return
+        except Exception as exc:
+            self.logger.warning("transcription audio decode failed: {}", exc)
+        if not audio_path:
+            await self._send_event(
+                connection,
+                "transcription_error",
+                request_id=request_id,
+                detail="decode",
+            )
+            return
+
+        try:
+            text = await transcribe_audio_file(audio_path, resolved)
+        finally:
+            with suppress(OSError):
+                Path(audio_path).unlink(missing_ok=True)
+        if not text:
+            await self._send_event(
+                connection,
+                "transcription_error",
+                request_id=request_id,
+                detail="empty",
+            )
+            return
+        await self._send_event(
+            connection,
+            "transcription_result",
+            request_id=request_id,
+            text=text,
+        )
+
     async def _dispatch_envelope(
         self,
         connection: Any,
@@ -702,6 +824,9 @@ class WebSocketChannel(BaseChannel):
                 scope="metadata",
                 workspace_scope=scope.payload(),
             )
+            return
+        if t == "transcribe_audio":
+            await self._handle_transcribe_audio(connection, envelope)
             return
         if t == "message":
             cid = envelope.get("chat_id")
