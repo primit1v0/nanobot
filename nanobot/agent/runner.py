@@ -54,6 +54,7 @@ from nanobot.utils.runtime import (
     repeated_external_lookup_error,
     repeated_tool_call_error,
     repeated_workspace_violation_error,
+    tool_call_signature,
 )
 
 GoalContinueMessage = str | Callable[[], str | None]
@@ -1045,15 +1046,25 @@ class AgentRunner:
                     )
                     for tool_call in batch
                 ))
-                tool_results.extend(batch_results)
             else:
                 batch_results = []
                 for tool_call in batch:
                     result = await self._run_tool(
                         spec, tool_call, external_lookup_counts, workspace_violation_counts, tool_call_counts,
                     )
-                    tool_results.append(result)
                     batch_results.append(result)
+
+            for tool_call, result in zip(batch, batch_results):
+                _, event, _ = result
+                sig = tool_call_signature(tool_call.name, tool_call.arguments)
+                if sig is not None:
+                    if event.get("status") == "error":
+                        if event.get("detail") != "repeated identical tool call blocked":
+                            tool_call_counts[sig] = tool_call_counts.get(sig, 0) + 1
+                    else:
+                        tool_call_counts[sig] = 0
+
+            tool_results.extend(batch_results)
 
         results: list[Any] = []
         events: list[dict[str, str]] = []
